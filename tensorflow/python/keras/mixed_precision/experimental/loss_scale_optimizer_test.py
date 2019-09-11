@@ -27,6 +27,7 @@ from tensorflow.python.distribute import mirrored_strategy
 from tensorflow.python.eager import context
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
+from tensorflow.python.keras import optimizers
 from tensorflow.python.keras.mixed_precision.experimental import loss_scale_optimizer
 from tensorflow.python.keras.mixed_precision.experimental import test_util as mp_test_util
 from tensorflow.python.keras.optimizer_v2 import adam
@@ -263,20 +264,17 @@ class LossScaleOptimizerTest(test.TestCase, parameterized.TestCase):
       self.assertEqual(self.evaluate(opt.loss_scale()),
                        initial_loss_scale * 16)
 
-  @test_util.run_in_graph_and_eager_modes
-  def testIterations(self):
-    opt = gradient_descent.SGD(2.0)
-    lso = loss_scale_optimizer.LossScaleOptimizer(opt, loss_scale=10.)
-    lso.iterations = 7
-    self.assertEqual(lso.iterations, 7)
-    self.assertEqual(opt.iterations, 7)
-
   @parameterized.named_parameters(*TESTCASES)
   @test_util.run_in_graph_and_eager_modes
   def testGettingAndSettingLearningRate(self, strategy_fn):
     with strategy_fn().scope() as strategy:
+      if (isinstance(strategy, mirrored_strategy.MirroredStrategy) and
+          control_flow_v2_toggles.control_flow_v2_enabled() and
+          not context.executing_eagerly()):
+        self.skipTest('b/138667997')
       var = variables.Variable([5.0])
       opt = adam.Adam(learning_rate=1.0)
+      opt = loss_scale_optimizer.LossScaleOptimizer(opt, 'dynamic')
       loss = lambda: var * 2.0
       run_fn = lambda: opt.minimize(loss, [var])
       run_op = strategy.experimental_run(run_fn)
@@ -298,22 +296,51 @@ class LossScaleOptimizerTest(test.TestCase, parameterized.TestCase):
         opt.not_an_attr += 3
 
   @test_util.run_in_graph_and_eager_modes
-  def testArbitraryAttributesNotExposed(self):
-    opt = adam.Adam(learning_rate=1.0)
-    # Test that Adam has attributes 'epsilon' and 'beta1'
-    opt.epsilon  # pylint: disable=pointless-statement
-    opt.beta_1  # pylint: disable=pointless-statement
-    opt = loss_scale_optimizer.LossScaleOptimizer(opt, loss_scale=10.)
-    # Test that attributes defined by OptimizerV2 subclasses are not exposed in
-    # LossScaleOptimizer, and that the error message is sensible.
+  def testNewOptimizerHasInterfaceOfBaseOptimizer(self):
+    var = variables.Variable([5.0])
+    opt = adam.Adam(learning_rate=1.0, beta_1=0.5, beta_2=0.9)
+    opt = loss_scale_optimizer.LossScaleOptimizer(opt, 'dynamic')
+    self.assertIsInstance(opt, adam.Adam)
+    # Force hyperparameters to be created
+    opt.lr  # pylint: disable=pointless-statement
+    self.evaluate(variables.global_variables_initializer())
+
+    self.assertAlmostEqual(self.evaluate(opt.beta_1), 0.5)
+    self.assertAlmostEqual(self.evaluate(opt.beta_2), 0.9)
+
+    called_set_weights = [False]
+
+    class MyAdam(adam.Adam):
+
+      def set_weights(self, weights):
+        # This allows to us to test that if we override methods from the base
+        # OptimizerV2, they are still called when wrapped with a loss scale
+        # optimizer.
+        called_set_weights[0] = True
+        super(MyAdam, self).set_weights(weights)
+
+    opt = MyAdam(learning_rate=1.0, beta_1=0.5, beta_2=0.9)
+    opt = loss_scale_optimizer.LossScaleOptimizer(opt, 'dynamic')
+    run_op = opt.minimize(lambda: var + 1., var_list=var)
+    self.evaluate(variables.global_variables_initializer())
+    self.evaluate(run_op)
+
+    opt.set_weights(opt.get_weights())
+    self.assertTrue(called_set_weights[0])
+
+  @test_util.run_in_graph_and_eager_modes
+  def testPassingInvalidOptimizer(self):
     with self.assertRaisesRegexp(
-        AttributeError,
-        "'LossScaleOptimizer' object has no attribute 'epsilon'"):
-      opt.epsilon  # pylint: disable=pointless-statement
+        ValueError, '"opt" must be an instance of a '
+                    'tf.keras.optimizers.Optimizer, but got'):
+      loss_scale_optimizer.LossScaleOptimizer(123, 'dynamic')
+
+    opt = gradient_descent.SGD(1.)
+    opt = loss_scale_optimizer.LossScaleOptimizer(opt, 'dynamic')
     with self.assertRaisesRegexp(
-        AttributeError,
-        "'LossScaleOptimizer' object has no attribute 'beta_1'"):
-      opt.beta_1  # pylint: disable=pointless-statement
+        ValueError, 'Cannot create a LossScaleOptimizer from an existing '
+                    'LossScaleOptimizer'):
+      loss_scale_optimizer.LossScaleOptimizer(opt, 'dynamic')
 
   @test_util.run_in_graph_and_eager_modes
   def testApplyGradientsGetsUnwrappedTensors(self):
@@ -362,7 +389,7 @@ class LossScaleOptimizerTest(test.TestCase, parameterized.TestCase):
       self.evaluate(opt_op)
       self.assertEqual(self.evaluate(loss_scale()), 1.)
       self.assertEqual(self.evaluate(loss_scale._num_good_steps), 1)
-      slot_var = opt._optimizer.get_slot(var, 'momentum')
+      slot_var = opt.get_slot(var, 'momentum')
       slot_value = self.evaluate(slot_var).item()
 
       # Save a checkpoint.
@@ -383,6 +410,70 @@ class LossScaleOptimizerTest(test.TestCase, parameterized.TestCase):
       self.assertEqual(self.evaluate(loss_scale()), 1.)
       self.assertEqual(self.evaluate(loss_scale._num_good_steps), 1)
       self.assertAlmostEqual(self.evaluate(slot_var).item(), slot_value)
+
+  def testGetConfig(self):
+    opt = gradient_descent.SGD(2., momentum=0.5)
+    loss_scale = loss_scale_module.DynamicLossScale(
+        initial_loss_scale=2., increment_period=3.,
+        multiplier=4.)
+    opt = loss_scale_optimizer.LossScaleOptimizer(opt, loss_scale)
+    config = opt.get_config()
+    opt = opt.__class__.from_config(config)
+    # Force hyperparameters to be created
+    opt.lr  # pylint: disable=pointless-statement
+    self.evaluate(variables.global_variables_initializer())
+
+    self.assertEqual(self.evaluate(opt.lr), 2.)
+    self.assertEqual(self.evaluate(opt.momentum), 0.5)
+    self.assertEqual(self.evaluate(opt.loss_scale()), 2.)
+    self.assertEqual(opt.loss_scale.increment_period, 3.)
+    self.assertEqual(opt.loss_scale.multiplier, 4.)
+
+  def testSerializationWithBuiltInOptimizer(self):
+    opt = gradient_descent.SGD(2., momentum=0.5)
+    loss_scale = loss_scale_module.DynamicLossScale(
+        initial_loss_scale=2., increment_period=3.,
+        multiplier=4.)
+    opt = loss_scale_optimizer.LossScaleOptimizer(opt, loss_scale)
+    config = optimizers.serialize(opt)
+    opt = optimizers.deserialize(config)
+    # Force hyperparameters to be created
+    opt.lr  # pylint: disable=pointless-statement
+    self.evaluate(variables.global_variables_initializer())
+
+    self.assertEqual(self.evaluate(opt.lr), 2.)
+    self.assertEqual(self.evaluate(opt.momentum), 0.5)
+    self.assertEqual(self.evaluate(opt.loss_scale()), 2.)
+    self.assertEqual(opt.loss_scale.increment_period, 3.)
+    self.assertEqual(opt.loss_scale.multiplier, 4.)
+
+  def testSerializationWithCustomOptimizer(self):
+    class MySGD(gradient_descent.SGD):
+
+      def __init__(self, *args, **kwargs):
+        super(MySGD, self).__init__(*args, **kwargs)
+        self.my_attribute = 123
+
+    opt = MySGD(2., momentum=0.5)
+    loss_scale = loss_scale_module.DynamicLossScale(
+        initial_loss_scale=2., increment_period=3.,
+        multiplier=4.)
+    opt = loss_scale_optimizer.LossScaleOptimizer(opt, loss_scale)
+    config = optimizers.serialize(opt)
+    custom_objects = {'MySGD': MySGD}
+    opt = optimizers.deserialize(config, custom_objects=custom_objects)
+    # Assert custom_objects has not been mutated
+    self.assertEqual(custom_objects, {'MySGD': MySGD})
+    # Force hyperparameters to be created
+    opt.lr  # pylint: disable=pointless-statement
+    self.evaluate(variables.global_variables_initializer())
+
+    self.assertEqual(self.evaluate(opt.lr), 2.)
+    self.assertEqual(self.evaluate(opt.momentum), 0.5)
+    self.assertEqual(self.evaluate(opt.loss_scale()), 2.)
+    self.assertEqual(opt.loss_scale.increment_period, 3.)
+    self.assertEqual(opt.loss_scale.multiplier, 4.)
+    self.assertEqual(opt.my_attribute, 123)
 
 
 if __name__ == '__main__':

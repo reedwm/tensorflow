@@ -17,7 +17,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from tensorflow.python.keras.mixed_precision.experimental.loss_scale_optimizer import LossScaleOptimizer
 from tensorflow.python.keras.mixed_precision.experimental.policy import global_policy
 from tensorflow.python.keras.mixed_precision.experimental.policy import Policy
 from tensorflow.python.keras.mixed_precision.experimental.policy import set_policy
