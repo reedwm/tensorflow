@@ -20,6 +20,8 @@ from __future__ import print_function
 from tensorflow.python.distribute import distribution_strategy_context
 from tensorflow.python.framework import smart_cond
 from tensorflow.python.keras import backend
+from tensorflow.python.keras import optimizers
+from tensorflow.python.keras.mixed_precision.experimental import loss_scale as keras_loss_scale_module
 from tensorflow.python.keras.optimizer_v2 import optimizer_v2
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.training.experimental import loss_scale as loss_scale_module
@@ -125,7 +127,7 @@ class LossScaleOptimizer(optimizer_v2.OptimizerV2):
                        'clipvalue %s' % (opt, opt.clipvalue))
 
     self._optimizer = opt
-    self._loss_scale = loss_scale_module.get(loss_scale)
+    self._loss_scale = keras_loss_scale_module.get(loss_scale)
     for weight in loss_scale_module.get_loss_scale_weights(self._loss_scale):
       # We cannot call `track_variable` in the LossScale class itself, because a
       # file outside of Keras cannot depend on a Keras file. Calling it here
@@ -243,6 +245,26 @@ class LossScaleOptimizer(optimizer_v2.OptimizerV2):
     return self._optimizer.apply_gradients(list(zip(grads, wrapped_vars.value)),
                                            name)
 
+  def get_config(self):
+    serialized_opt = optimizers.serialize(self._optimizer)
+    serialized_loss_scale = keras_loss_scale_module.serialize(self._loss_scale)
+    return {
+        'opt': serialized_opt,
+        'loss_scale': serialized_loss_scale,
+    }
+
+  @classmethod
+  def from_config(cls, config, custom_objects=None):
+    config = config.copy()  # Make a copy, since we mutate config
+    config['opt'] = optimizers.deserialize(
+        config['opt'], custom_objects=custom_objects)
+    config['loss_scale'] = keras_loss_scale_module.deserialize(
+        config['loss_scale'], custom_objects=custom_objects)
+    return cls(**config)
+
+  # Delegations: We delegate most OptimizerV2 methods to the wrapped optimizer
+  # below.
+
   @property
   def iterations(self):
     return self._optimizer.iterations
@@ -250,6 +272,22 @@ class LossScaleOptimizer(optimizer_v2.OptimizerV2):
   @iterations.setter
   def iterations(self, variable):
     self._optimizer.iterations = variable
+
+  def get_slot_names(self):
+    return self._optimizer.get_slot_names()
+
+  def variables(self):
+    return self._optimizer.variables()
+
+  @property
+  def weights(self):
+    return self._optimizer.weights
+
+  def get_weights(self):
+    return self._optimizer.get_weights()
+
+  def set_weights(self, weights):
+    return self._optimizer.set_weights(weights)
 
   # For the most part, we only expose methods in the base OptimizerV2, not
   # individual subclasses like Adam. However, although "learning_rate" and "lr"
@@ -272,22 +310,35 @@ class LossScaleOptimizer(optimizer_v2.OptimizerV2):
   def lr(self, lr):
     self._optimizer.lr = lr
 
-  def get_slot_names(self):
-    """A list of names for this optimizer's slots."""
-    return self._optimizer.get_slot_names()
+  def get_slot(self, var, slot_name):
+    # We cannot implement get_slot for the following reason: When saving a
+    # checkpoint, two optimizers cannot share slot variables. Since both the
+    # LossScaleOptimizer and the wrapped optimizer (self and self._optimizer
+    # respectively) are checkpointed, we cannot expose the wrapped optimizer's
+    # slots in the LossScaleOptimizer. Otherwise, a checkpoint would believe
+    # both optimizers share slot variables.
+    raise AttributeError(
+        'You cannot call get_slot on a LossScaleOptimizer. This limitation '
+        'will be removed in the future.')
+
+  def add_slot(self, var, slot_name, initializer='zeros'):
+    # We disallow adding a slot for consistency with `get_slot`.
+    raise AttributeError(
+        'You cannot call add_slot on a LossScaleOptimizer. This limitation '
+        'will be removed in the future.')
+
+  # We do not override some OptimizerV2 methods. For each, we describe why we do
+  # not delegate them to self._optimizer:
+  # * get_updates: get_updates() calls get_gradients(). Since we override
+  #   get_gradients(), we cannot delegate get_updates() to self._optimizer,
+  #   otherwise the overridden get_gradients() method would not be called.
+  #   Luckily, get_updates() does not access any OptimizerV2 fields, so
+  #   inheriting the OptimizerV2 version works fine.
+  # * minimize: We don't delegate for a similar as get_updates(): it calls
+  #   both self._compute_gradients() and self.apply_gradients(), and both need
+  #   to have the LossScaleOptimizer version called.
 
   # TODO(reedwm): Maybe merge this class's functionality into OptimizerV2.
 
   # TODO(reedwm): Maybe throw an error if mixed precision is used without this
   # optimizer being used.
-
-  # TODO(reedwm): Implement get_config and from_config. This will first require
-  # implementing deserialization support for OptimizerV2.
-  def get_config(self):
-    raise NotImplementedError('get_config() is not yet implemented for '
-                              'LossScaleOptimizers')
-
-  @classmethod
-  def from_config(cls, config, custom_objects=None):
-    raise NotImplementedError('from_config() is not yet implemented for '
-                              'LossScaleOptimizers')
