@@ -40,6 +40,9 @@ limitations under the License.
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/util/env_var.h"
+#if defined(INTEL_MKL) && defined(ENABLE_INTEL_MKL_BFLOAT16)
+#include "tensorflow/core/graph/mkl_graph_util.h"
+#endif
 
 namespace tensorflow {
 namespace grappler {
@@ -885,6 +888,69 @@ bool HasInputOrOutputRefs(const NodeDef& node) {
   return false;
 }
 
+#if defined(INTEL_MKL) && defined(ENABLE_INTEL_MKL_BFLOAT16)
+
+inline bool FusedConv2DRewrite(const NodeDef& n) {
+  // MKL DNN currently doesn't support all fusions that grappler fuses
+  // together with Conv2D (ex. batchnorm). We rewrite _FusedConv2D only if
+  // it includes those we support.
+  DataType T;
+  if (!TryGetNodeAttr(n, "T", &T) ||
+      !mkl_op_registry::IsMklLayoutDependentOp("_MklFusedConv2D", T)) {
+    return false;
+  }
+  std::vector<string> fused_ops;
+  TF_CHECK_OK(GetNodeAttr(n, "fused_ops", &fused_ops));
+  return (fused_ops == std::vector<string>{"BiasAdd"} ||
+          fused_ops == std::vector<string>{"Relu"} ||
+          fused_ops == std::vector<string>{"Relu6"} ||
+          fused_ops == std::vector<string>{"Elu"} ||
+          fused_ops == std::vector<string>{"BiasAdd", "Relu"} ||
+          fused_ops == std::vector<string>{"BiasAdd", "Relu6"} ||
+          fused_ops == std::vector<string>{"BiasAdd", "Elu"} ||
+          fused_ops == std::vector<string>{"BiasAdd", "Add"} ||
+          fused_ops == std::vector<string>{"BiasAdd", "Add", "Relu"});
+}
+inline bool FusedMatMulRewrite(const NodeDef& n) {
+  bool trans_a;
+  std::vector<string> fused_ops;
+
+  // Do not rewrite with transpose attribute because reorder has performance
+  // impact.
+  TF_CHECK_OK(GetNodeAttr(n, "transpose_a", &trans_a));
+  // Do not rewrite with more than 1 post op because MKL-DNN doesn't support.
+  TF_CHECK_OK(GetNodeAttr(n, "fused_ops", &fused_ops));
+
+  return (!trans_a) && fused_ops == std::vector<string>{"BiasAdd"};
+}
+
+inline string GetMklOpNameExtended(const NodeDef& n) {
+  string mkl_op_name = mkl_op_registry::GetMklOpName(n.op());
+  // For some ops, we do not follow standard rule of just
+  // prefixing _Mkl to the type_string to obtain corresponding Mkl
+  // type_string. For them, we need special case.
+  if (n.op() == "_FusedConv2D" && FusedConv2DRewrite(n))
+    mkl_op_name = "_MklFusedConv2D";
+  else if (n.op() == "__MklDummyPadWithConv2D")
+    mkl_op_name = "_MklPadWithConv2D";
+  else if (n.op() == "__MklDummyPadWithFusedConv2D")
+    mkl_op_name = "_MklPadWithFusedConv2D";
+  else if (n.op() == "__MklDummyConv2DWithBias")
+    mkl_op_name = "_MklConv2DWithBias";
+  else if (n.op() == "__MklDummyConv2DBackpropFilterWithBias")
+    mkl_op_name = "_MklConv2DBackpropFilterWithBias";
+  else if (n.op() == "_FusedMatMul" && FusedMatMulRewrite(n))
+    mkl_op_name = "_MklFusedMatMul";
+  return mkl_op_name;
+}
+
+bool ConvertibleToBfloat16MklOp(const NodeDef& n) {
+  string mkl_op_name = GetMklOpNameExtended(n);
+  return mkl_op_registry::IsMklOp(mkl_op_name, DT_BFLOAT16);
+}
+
+#endif  // defined(INTEL_MKL) && defined(ENABLE_INTEL_MKL_BFLOAT16)
+
 // See TF issue 25977 for no-FP16 on SCEWL
 bool CanForceFP16(const NodeDef& node) {
   return node.op() != "Const" && node.op() != "SoftmaxCrossEntropyWithLogits" &&
@@ -952,7 +1018,8 @@ class AutoMixedPrecisionImpl {
         return std::make_unique<AutoMixedPrecisionListsCuda>(cuda_version_,
                                                              cudnn_version_);
       case AutoMixedPrecisionMode::MKL:
-        return std::make_unique<AutoMixedPrecisionListsMkl>();
+        return std::make_unique<AutoMixedPrecisionListsMkl>(
+            SupportedBfloat16MklOps());
     }
   }
   Status PrintDebugLogs(bool preop, size_t timestamp);
@@ -992,6 +1059,7 @@ class AutoMixedPrecisionImpl {
   NodeDef BuildCastNode(const MutableGraphView::OutputPort& src, bool to_f16,
                         const string& device) const;
   Status ChangeTypeAttrsAndAddCasts(const absl::flat_hash_set<int>& white_set);
+  gtl::FlatSet<string> SupportedBfloat16MklOps() const;
 
   VirtualPlacer virtual_placer_;
   std::unordered_set<string> nodes_to_preserve_;
@@ -1252,17 +1320,8 @@ Status AutoMixedPrecisionImpl::Optimize() {
         "UNSAFE_FORCE_ALL when MKL is used");
   }
 
-  std::unique_ptr<AutoMixedPrecisionLists> mp_lists =
-      get_mixed_precision_lists();
-  f16_whitelist_ = mp_lists->WhiteList();
-  f16_blacklist_ = mp_lists->BlackList();
-  f16_graylist_ = mp_lists->GrayList();
-  f16_clearlist_ = mp_lists->ClearList();
-  TF_RETURN_IF_ERROR(ValidateLists(f16_whitelist_, f16_blacklist_,
-                                   f16_graylist_, f16_clearlist_));
 
   size_t timestamp = Env::Default()->NowMicros() / 1000;
-  TF_RETURN_IF_ERROR(PrintDebugLogs(/* preop = */ true, timestamp));
 
   VLOG(2) << "Identifying nodes that should be processed";
   for (const NodeDef& node : graph_->node()) {
@@ -1308,6 +1367,16 @@ Status AutoMixedPrecisionImpl::Optimize() {
     FindTensorListImplicitFloat32Edges(cluster, &ephemeral_edges);
   }
   TF_RETURN_IF_ERROR(graph_type_view_.AddEphemeralEdges(ephemeral_edges));
+
+  std::unique_ptr<AutoMixedPrecisionLists> mp_lists =
+      get_mixed_precision_lists();
+  f16_whitelist_ = mp_lists->WhiteList();
+  f16_blacklist_ = mp_lists->BlackList();
+  f16_graylist_ = mp_lists->GrayList();
+  f16_clearlist_ = mp_lists->ClearList();
+  TF_RETURN_IF_ERROR(ValidateLists(f16_whitelist_, f16_blacklist_,
+                                   f16_graylist_, f16_clearlist_));
+  TF_RETURN_IF_ERROR(PrintDebugLogs(/* preop = */ true, timestamp));
 
   // The goal here is to change performance-critical ops to fp16 or bf16, and to
   // do so with the minimal number of casts, subject to the constraint that the
@@ -1928,6 +1997,26 @@ Status AutoMixedPrecisionImpl::ChangeTypeAttrsAndAddCasts(
   return Status::OK();
 }
 
+gtl::FlatSet<string> AutoMixedPrecisionImpl::SupportedBfloat16MklOps() const {
+#if defined(INTEL_MKL) && defined(ENABLE_INTEL_MKL_BFLOAT16)
+  gtl::FlatSet<string> supported_bfloat16_ops;
+  for (int i = 0; i < graph_type_view_.num_nodes(); i++) {
+    const NodeTypeId& node_type = *graph_type_view_.GetNode(i);
+    const string& op = node_type.node->op();
+    if ((ConvertibleToBfloat16MklOp(*node_type.node) ||
+         SupportsF16(node_type)) &&
+        op != "BiasAdd" && op != "BiasAddGrad") {
+      VLOG(3) << "  Adding node: " << node_type.node->name();
+      supported_bfloat16_ops.insert(op);
+    }
+  }
+  return supported_bfloat16_ops;
+#else
+  return {};
+#endif
+}
+
+
 int GetNumGPUs(const Cluster& cluster,
                const std::pair<int, int>& min_arch = {0, 0}) {
   auto devices = cluster.GetDevices();
@@ -1949,6 +2038,17 @@ Status AutoMixedPrecision::Optimize(Cluster* cluster, const GrapplerItem& item,
   if (cluster == nullptr) {
     return errors::InvalidArgument("cluster == nullptr");
   }
+
+#if !defined(INTEL_MKL) || !defined(ENABLE_INTEL_MKL_BFLOAT16)
+  if (mode_ == AutoMixedPrecisionMode::MKL) {
+    return errors::Unimplemented(
+        "The auto_mixed_precision_mkl optimizer cannot be used since "
+        "this build of TensorFlow is not compiled with MKL support. For "
+        "information on MKL builds, see: "
+        "https://software.intel.com/en-us/articles/intel-optimization-for-"
+        "tensorflow-installation-guide");
+  }
+#endif
 
   // Start by copying input graph to output.
   *output = item.graph;

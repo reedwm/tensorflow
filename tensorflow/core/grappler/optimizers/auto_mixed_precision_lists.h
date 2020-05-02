@@ -347,10 +347,10 @@ class AutoMixedPrecisionListsCuda : public AutoMixedPrecisionLists {
 };
 
 class AutoMixedPrecisionListsMkl : public AutoMixedPrecisionLists {
- private:
-
  public:
-  AutoMixedPrecisionListsMkl() {}
+  explicit AutoMixedPrecisionListsMkl(
+      gtl::FlatSet<string> supported_bfloat16_ops) :
+      supported_bfloat16_ops_(std::move(supported_bfloat16_ops)) {}
 
   // Only ops which are supported by MKL in bfloat16 should be added to the
   // white list, gray list, or clear list.
@@ -375,26 +375,16 @@ class AutoMixedPrecisionListsMkl : public AutoMixedPrecisionLists {
   }
 
   gtl::FlatSet<string> GrayList() override {
-    auto list = gtl::FlatSet<string>{
-        "Add",
-        "AddN",
-        "AddV2",
-        "AvgPool",
-        "AvgPool3D",
-        "AvgPool3DGrad",
-        "AvgPoolGrad",
-        "BiasAdd",
-        "BiasAddGrad",
-        "BiasAddV1",
-        "FusedBatchNormV2",
-        "FusedBatchNormGradV2",
-        "FusedBatchNormV3",
-        "FusedBatchNormGradV3",
-        "LeakyRelu",
-        "LeakyReluGrad",
-        "Mul",
-        "Sub",
-    };
+    gtl::FlatSet<string> list(supported_bfloat16_ops_);
+    for (const string& op : WhiteList()) {
+      list.erase(op);
+    }
+    for (const string& op : BlackList()) {
+      list.erase(op);
+    }
+    for (const string& op : ClearList()) {
+      list.erase(op);
+    }
     UpdateList("GRAYLIST", &list);
     return list;
   }
@@ -457,6 +447,8 @@ class AutoMixedPrecisionListsMkl : public AutoMixedPrecisionLists {
     UpdateList("CLEARLIST", &list);
     return list;
   }
+ private:
+  gtl::FlatSet<string> supported_bfloat16_ops_;
 };
 
 }  // end namespace grappler
