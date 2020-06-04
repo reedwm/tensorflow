@@ -139,7 +139,8 @@ class LSTMOpModel : public SingleOpModel {
 
     // Do not apply delegate yet since tensor values are not known (and more
     // specifically scales in quantized tensors are not known).
-    BuildInterpreter(input_shapes, /*allow_fp32_relax_to_fp16=*/false,
+    BuildInterpreter(input_shapes, /*num_threads=*/-1,
+                     /*allow_fp32_relax_to_fp16=*/false,
                      /*apply_delegate=*/false);
   }
 
@@ -2050,7 +2051,7 @@ TEST_P(CifgPeepholeProjectionNoClippingLayerNormLstmTest,
       }};
 
   VerifyGoldens(lstm_input_, lstm_golden_output_, &layer_norm_lstm,
-                /*tolerance=*/0.000902065);
+                /*tolerance=*/0.0009021);
 }
 
 class CifgPeepholeProjectionNoClippingLayerNormLstmInt8Test
@@ -2259,7 +2260,8 @@ class LSTMIntegerOpModel : public SingleOpModel {
 
     // Do not apply delegate yet since tensor values are not known (and more
     // specifically scales in quantized tensors are not known).
-    BuildInterpreter(input_shapes, /*allow_fp32_relax_to_fp16=*/false,
+    BuildInterpreter(input_shapes, /*num_threads=*/-1,
+                     /*allow_fp32_relax_to_fp16=*/false,
                      /*apply_delegate=*/false);
   }
 
@@ -2938,7 +2940,8 @@ class LSTMIntegerOpModel8x8_8 : public SingleOpModel {
 
     // Do not apply delegate yet since tensor values are not known (and more
     // specifically scales in quantized tensors are not known).
-    BuildInterpreter(input_shapes, /*allow_fp32_relax_to_fp16=*/false,
+    BuildInterpreter(input_shapes, /*num_threads=*/-1,
+                     /*allow_fp32_relax_to_fp16=*/false,
                      /*apply_delegate=*/false);
   }
 

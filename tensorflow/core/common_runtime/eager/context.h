@@ -32,8 +32,10 @@ limitations under the License.
 // clang-format on
 
 #include "absl/types/optional.h"
+#include "absl/container/flat_hash_map.h"
 #include "tensorflow/c/eager/context_interface.h"
 #include "tensorflow/c/experimental/saved_model/core/saved_model_api.h"
+#include "tensorflow/core/common_runtime/composite_device.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/eager/eager_executor.h"
@@ -171,6 +173,11 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
 
   AbstractTensorInterface* CreateTensor(
       DataType dtype, absl::Span<const int64> dim_sizes) override;
+  AbstractTensorInterface* CreateTensor(DataType dtype, const int64_t* dims,
+                                        int num_dims, void* data, size_t len,
+                                        bool convert_string,
+                                        MemoryReleaser memory_releaser,
+                                        void* memory_releaser_arg) override;
 
   AbstractTensorHandleInterface* CreateLocalHandle(
       AbstractTensorInterface* t) override;
@@ -288,12 +295,16 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
   // errors, and the error message will be combined from all executors.
   Status SyncExecutors();
 
+  Status AsyncWait() override { return SyncExecutors(); }
+
   core::RefCountPtr<KernelAndDevice> GetCachedKernel(Fprint128 cache_key);
 
   void AddKernelToCache(Fprint128 cache_key, KernelAndDevice* kernel);
 
   bool LogDevicePlacement() const { return log_device_placement_; }
+  void SetLogDevicePlacement(bool enable) { log_device_placement_ = enable; }
   bool AllowSoftPlacement() const { return allow_soft_placement_; }
+  void SetAllowSoftPlacement(bool enable) { allow_soft_placement_ = enable; }
   bool LogMemory() const { return log_memory_; }
 
   Rendezvous* GetRendezvous() const { return rendezvous_; }
@@ -344,8 +355,8 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
   RunMetadata* RunMetadataProto() { return &run_metadata_; }
   void ClearRunMetadata() TF_EXCLUSIVE_LOCKS_REQUIRED(metadata_mu_);
 
-  void StartStep();
-  void EndStep();
+  void StartStep() override;
+  void EndStep() override;
   ScopedStepContainer* StepContainer();
 
   FunctionLibraryDefinition* FuncLibDef() { return &func_lib_def_; }
@@ -388,7 +399,7 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
       std::unique_ptr<eager::EagerClientCache> remote_eager_workers,
       std::unique_ptr<DynamicDeviceMgr> remote_device_manager,
       const std::vector<string>& remote_contexts, uint64 context_id,
-      Rendezvous* r, DeviceMgr* local_device_mgr, int keep_alive_secs,
+      Rendezvous* r, const DeviceMgr* local_device_mgr, int keep_alive_secs,
       DistributedFunctionLibraryRuntime* cluster_flr,
       std::unique_ptr<eager::RemoteMgr, std::function<void(eager::RemoteMgr*)>>
           remote_mgr);
@@ -425,7 +436,7 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
       const std::vector<string>& remote_contexts, uint64 context_id);
 
   Status StoreCollectiveOpsServer(
-      std::unique_ptr<ServerInterface> new_server, DeviceMgr* device_mgr,
+      std::unique_ptr<ServerInterface> new_server, const DeviceMgr* device_mgr,
       CollectiveExecutorMgrInterface* rpc_collective_executor_mgr);
 
   // For the specified remote worker, preprocess and set its device filters.
@@ -481,15 +492,25 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
 
   Status FindDeviceFromName(const char* device_name, Device** device) const;
 
+  Status FindCompositeDeviceFromName(const char* device_name,
+                                     CompositeDevice** device) const;
+
   Status FindCustomDeviceFromName(const string& device_name,
                                   CustomDevice** dev) const;
 
   Status RegisterCustomDevice(const string& name,
                               std::unique_ptr<CustomDevice> device);
 
+  // Find or create a composite device with the given `underlying_devices`.
+  Status FindOrCreateCompositeDevice(
+      const std::vector<string>& underlying_devices,
+      CompositeDevice** composite_device);
+
   bool OnSameTask(const Device* first, const Device* second) const;
   // Gets the CPU device on the task of device.
   Status CPUDeviceOnTask(const Device* device, Device** cpu_device) const;
+
+  const SessionOptions& session_options() const { return opts_; }
 
  private:
   ~EagerContext() override;
@@ -544,6 +565,7 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
     T* unowned_object_ptr = nullptr;
   };
 
+  SessionOptions opts_;
   const ContextDevicePlacementPolicy default_device_placement_policy_;
   const ContextMirroringPolicy default_mirroring_policy_;
 
@@ -556,6 +578,8 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
       TF_GUARDED_BY(policy_map_mu_);
 
   OwnedOrUnownedHelper<const DeviceMgr> local_device_manager_;
+  // Maintain copy of all previously created local device managers.
+  std::vector<std::unique_ptr<const DeviceMgr>> old_local_device_managers_;
 
   // Unowned DynamicDeviceMgr is set on remote worker to allow running
   // multi-device function on remote worker.
@@ -568,6 +592,13 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
   Rendezvous* rendezvous_;
   std::function<Rendezvous*(const int64)> rendezvous_creator_;
   std::unordered_map<string, std::unique_ptr<CustomDevice>> custom_devices_;
+
+  mutable mutex composite_devices_mu_;
+  // Maps from the fingerprint of a set of device names to a virtual
+  // CompositeDevice.
+  // TODO(b/145922293): Consider taking device names as keys.
+  absl::flat_hash_map<uint64, std::unique_ptr<CompositeDevice>>
+      composite_devices_ GUARDED_BY(composite_devices_mu_);
 
   FunctionLibraryDefinition func_lib_def_{OpRegistry::Global(), {}};
 
@@ -603,9 +634,8 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
   mutex metadata_mu_;
   RunMetadata run_metadata_ TF_GUARDED_BY(metadata_mu_);
   GraphCollector graph_collector_;
-  // TODO(fishx): Allow update following two bool after context creation.
-  const bool log_device_placement_;
-  const bool allow_soft_placement_;
+  std::atomic<bool> log_device_placement_;
+  std::atomic<bool> allow_soft_placement_;
 
   // Information related to step containers.
   std::atomic<int> num_active_steps_;
@@ -637,7 +667,7 @@ class EagerContext : public AbstractContextInterface, public core::RefCounted {
       std::unique_ptr<eager::EagerClientCache> remote_eager_workers,
       std::unique_ptr<DynamicDeviceMgr> remote_device_manager,
       uint64 context_id, uint64 context_view_id, Rendezvous* r,
-      DeviceMgr* local_device_mgr, int keep_alive_secs,
+      const DeviceMgr* local_device_mgr, int keep_alive_secs,
       DistributedFunctionLibraryRuntime* cluster_flr,
       std::unique_ptr<eager::RemoteMgr, std::function<void(eager::RemoteMgr*)>>
           remote_mgr);

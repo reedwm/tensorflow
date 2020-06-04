@@ -13,49 +13,46 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "absl/types/variant.h"
+#include <memory>
+#include <vector>
+
+#include "absl/strings/str_cat.h"
 #include "tensorflow/c/c_api.h"
-#include "tensorflow/c/eager/c_api.h"
 #include "tensorflow/c/eager/c_api_internal.h"
-#include "tensorflow/c/eager/c_api_unified_experimental_private.h"
-#include "tensorflow/c/tf_status_helper.h"
-#include "tensorflow/core/common_runtime/device.h"
-#include "tensorflow/core/lib/monitoring/counter.h"
-#include "tensorflow/core/lib/monitoring/gauge.h"
-#include "tensorflow/core/lib/monitoring/sampler.h"
-#include "tensorflow/core/platform/casts.h"
-#include "tensorflow/core/platform/mutex.h"
+#include "tensorflow/c/eager/c_api_unified_experimental.h"
+#include "tensorflow/c/eager/c_api_unified_experimental_internal.h"
+#include "tensorflow/c/tf_datatype.h"
+#include "tensorflow/c/tf_status.h"
 #include "tensorflow/core/platform/strcat.h"
+#include "tensorflow/core/platform/types.h"
 
 using tensorflow::string;
-using tensorflow::internal::AbstractFunction;
-using tensorflow::internal::AbstractOp;
-using tensorflow::internal::AbstractTensor;
-using tensorflow::internal::dynamic_cast_helper;
-using tensorflow::internal::ExecutionContext;
-using tensorflow::internal::OutputList;
-using tensorflow::internal::unwrap;
-using tensorflow::internal::wrap;
 
-class TF_GraphContext;
+namespace tensorflow {
+namespace internal {
 
+class GraphContext;
+
+// GraphTensor wraps a `TF_Output`, i.e. a pointer to TF_Operation and the index
+// into the list of outputs for the operation.
 struct GraphTensor : public AbstractTensor {
   TF_Output output{};
-  TF_GraphContext* ctx = nullptr;
+  GraphContext* ctx = nullptr;
   GraphTensor() : AbstractTensor(kKind) {}
-  GraphTensor(TF_Output output, TF_GraphContext* ctx)
+  GraphTensor(TF_Output output, GraphContext* ctx)
       : AbstractTensor(kKind), output(output), ctx(ctx) {}
   static constexpr AbstractTensorKind kKind = kGraphTensor;
 };
 
-class TF_GraphOp : public AbstractOp {
+// GraphOp wraps and populate a TF_OperationDescription.
+class GraphOp : public AbstractOp {
  public:
-  explicit TF_GraphOp(TF_Graph* g) : AbstractOp(kKind), g_(g) {}
+  explicit GraphOp(TF_Graph* g) : AbstractOp(kKind), g_(g) {}
   void SetOpType(const char* const op_type, TF_Status* s) override {
     if (op_) {
       TF_SetStatus(
           s, TF_FAILED_PRECONDITION,
-          absl::StrCat("SetOpType called on already built op.").c_str());
+          strings::StrCat("SetOpType called on already built op.").c_str());
       return;
     }
     if (op_name_ != nullptr) {
@@ -69,7 +66,7 @@ class TF_GraphOp : public AbstractOp {
     if (op_) {
       TF_SetStatus(
           s, TF_FAILED_PRECONDITION,
-          absl::StrCat("SetOpName called on already built op.").c_str());
+          strings::StrCat("SetOpName called on already built op.").c_str());
       return;
     }
     if (op_type_ != nullptr) {
@@ -89,12 +86,12 @@ class TF_GraphOp : public AbstractOp {
     }
     TF_SetAttrType(op_.get(), attr_name, value);
   }
-  ~TF_GraphOp() override {}
+  ~GraphOp() override {}
 
   static constexpr AbstractOpKind kKind = kGraphOp;
 
  private:
-  friend class TF_GraphContext;  // For access to op_.
+  friend class GraphContext;  // For access to op_.
   TF_Graph* g_;
   std::unique_ptr<TF_OperationDescription> op_;
   // Hold `op_type` and `op_name` till both are available since we need both
@@ -103,6 +100,7 @@ class TF_GraphOp : public AbstractOp {
   const char* op_name_ = nullptr;
 };
 
+// GraphFunction is a thin wrapper over a TF_Function.
 struct GraphFunction : public AbstractFunction {
   TF_Function* func = nullptr;
   GraphFunction() : AbstractFunction(kKind) {}
@@ -117,28 +115,36 @@ struct GraphFunction : public AbstractFunction {
   static constexpr AbstractFunctionKind kKind = kGraphFunc;
 };
 
-class TF_GraphContext : public ExecutionContext {
+// GraphContext wraps a TF_Graph modeling a single function and manages the
+// "execution" of operation, i.e. adding them to the function.
+class GraphContext : public ExecutionContext {
  public:
-  TF_GraphContext()
-      : ExecutionContext(kKind), graph_(new TF_Graph(), TF_DeleteGraph) {}
+  explicit GraphContext(const char* name)
+      : ExecutionContext(kKind),
+        graph_(new TF_Graph(), TF_DeleteGraph),
+        name_(name) {}
 
   AbstractOp* CreateOperation() override {
     // TODO(srbs): Should the lifetime of this op be tied to the context.
-    return new TF_GraphOp(graph_.get());
+    return new GraphOp(graph_.get());
   }
 
   void ExecuteOperation(AbstractOp* op, int num_inputs,
                         AbstractTensor* const* inputs, OutputList* o,
                         TF_Status* s) override {
-    auto* graph_op = dynamic_cast_helper<TF_GraphOp>(op);
+    auto* graph_op = dyncast<GraphOp>(op);
     if (graph_op == nullptr) {
       TF_SetStatus(s, TF_INVALID_ARGUMENT,
                    "Unable to cast AbstractOp to TF_GraphOp.");
       return;
     }
     auto* tf_opdesc = graph_op->op_.release();
+    if (tf_opdesc == nullptr) {
+      TF_SetStatus(s, TF_INVALID_ARGUMENT, "AbstractOp is incomplete.");
+      return;
+    }
     for (int i = 0; i < num_inputs; ++i) {
-      auto* graph_tensor = dynamic_cast_helper<GraphTensor>(inputs[i]);
+      auto* graph_tensor = dyncast<GraphTensor>(inputs[i]);
       if (!graph_tensor) {
         TF_SetStatus(s, TF_INVALID_ARGUMENT,
                      "Capturing eager tensors is not supported yet.");
@@ -165,24 +171,38 @@ class TF_GraphContext : public ExecutionContext {
     }
   }
 
-  TF_Function* ToFunction(const char* fn_name, int num_inputs,
-                          const GraphTensor* inputs, int num_outputs,
-                          const GraphTensor* outputs, TF_Status* status) const {
-    std::vector<TF_Output> graph_inputs;
-    graph_inputs.resize(num_inputs);
+  AbstractTensor* AddParameter(TF_DataType dtype, TF_Status* s) override {
+    TF_OperationDescription* opdesc =
+        TF_NewOperation(graph_.get(), "Placeholder",
+                        absl::StrCat("_input_", inputs_.size()).c_str());
+    TF_SetAttrType(opdesc, "dtype", dtype);
+    auto* operation = TF_FinishOperation(opdesc, s);
+    if (!s->status.ok()) return nullptr;
+
+    inputs_.push_back(TF_Output{operation, 0});
+    return new GraphTensor(inputs_.back(), this);
+  }
+
+  AbstractFunction* Finalize(OutputList* outputs, TF_Status* s) override {
+    std::unique_ptr<GraphFunction> func(new GraphFunction);
     std::vector<TF_Output> graph_outputs;
-    graph_outputs.resize(num_outputs);
-    for (int i = 0; i < num_inputs; i++) {
-      graph_inputs[i] = inputs[i].output;
-    }
-    for (int i = 0; i < num_outputs; i++) {
-      graph_outputs[i] = outputs[i].output;
+    graph_outputs.reserve(outputs->outputs.size());
+    for (AbstractTensor* abstract_output : outputs->outputs) {
+      GraphTensor* output = dyncast<GraphTensor>(abstract_output);
+      if (!output) {
+        TF_SetStatus(s, TF_UNIMPLEMENTED,
+                     "Returning a non-graph tensor from a function has not "
+                     "been implemented yet.");
+        return nullptr;
+      }
+      graph_outputs.push_back(output->output);
     }
 
-    return TF_GraphToFunction(graph_.get(), fn_name, 0, -1, nullptr,
-                              graph_inputs.size(), graph_inputs.data(),
-                              graph_outputs.size(), graph_outputs.data(),
-                              nullptr, nullptr, fn_name, status);
+    func->func = TF_GraphToFunction(
+        graph_.get(), name_, 0, -1, nullptr, inputs_.size(), inputs_.data(),
+        graph_outputs.size(), graph_outputs.data(), nullptr, nullptr, name_, s);
+    if (TF_GetCode(s) != TF_OK) return nullptr;
+    return func.release();
   }
 
   void RegisterFunction(AbstractFunction* func, TF_Status* s) override {
@@ -190,40 +210,26 @@ class TF_GraphContext : public ExecutionContext {
                  "Registering graph functions has not been implemented yet.");
   }
 
-  ~TF_GraphContext() override {}
+  ~GraphContext() override {}
 
   static constexpr ExecutionContextKind kKind = kGraphContext;
 
  private:
   std::unique_ptr<TF_Graph, decltype(&TF_DeleteGraph)> graph_;
+  std::vector<TF_Output> inputs_;
+  const char* name_;
 };
 
-TF_ExecutionContext* TF_NewGraphExecutionContext(TF_Status* s) {
-  return wrap(new TF_GraphContext());
+static ExecutionContext* GraphTracingFactory(const char* name, TF_Status* s) {
+  return new GraphContext(name);
 }
 
-TF_AbstractFunction* TF_ExecutionContextToFunction(
-    const TF_ExecutionContext* fn_body, const char* fn_name, int num_inputs,
-    const TF_AbstractTensor* inputs, int num_outputs,
-    const TF_AbstractTensor* outputs, TF_Status* status) {
-  auto* graph_ctx = dynamic_cast_helper<const TF_GraphContext>(unwrap(fn_body));
-  if (graph_ctx == nullptr) {
-    TF_SetStatus(status, TF_INVALID_ARGUMENT,
-                 "fn_body is not a TF_GraphContext.");
-    return nullptr;
-  }
-  auto* graph_inputs = dynamic_cast_helper<const GraphTensor>(unwrap(inputs));
-  if (!graph_inputs) {
-    TF_SetStatus(status, TF_INVALID_ARGUMENT, "inputs aren't GraphTensors.");
-    return nullptr;
-  }
-  auto* graph_outputs = dynamic_cast_helper<const GraphTensor>(unwrap(outputs));
-  if (!graph_outputs) {
-    TF_SetStatus(status, TF_INVALID_ARGUMENT, "outputs aren't GraphTensors.");
-    return nullptr;
-  }
-  GraphFunction* func = new GraphFunction;
-  func->func = graph_ctx->ToFunction(fn_name, num_inputs, graph_inputs,
-                                     num_outputs, graph_outputs, status);
-  return wrap(func);
-}
+// Register the tracing implemented in this file as the default tracing engine.
+static bool register_tracing = [] {
+  RegisterTracingEngineFactory("graphdef", GraphTracingFactory);
+  SetDefaultTracingEngine("graphdef");
+  return true;
+}();
+
+}  // namespace internal
+}  // namespace tensorflow

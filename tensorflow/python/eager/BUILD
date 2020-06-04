@@ -1,5 +1,7 @@
-load("//tensorflow:tensorflow.bzl", "tf_py_test")
 load("//tensorflow:tensorflow.bzl", "cuda_py_test")
+
+# buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "tf_py_test")
 
 # buildifier: disable=same-origin-load
 load("//tensorflow:tensorflow.bzl", "tf_python_pybind_extension")
@@ -28,6 +30,10 @@ cc_library(
         "pywrap_tensor_conversion.h",
         "pywrap_tfe.h",
     ],
+    copts = ["-fexceptions"],
+    features = [
+        "-use_header_modules",  # Required for pybind11
+    ],
     visibility = [
         "//learning/deepmind/courier:__subpackages__",
         "//tensorflow:internal",
@@ -40,6 +46,9 @@ cc_library(
         "//tensorflow/c/eager:c_api_internal",
         "//tensorflow/c/eager:dlpack",
         "//tensorflow/c/eager:tape",
+        "//tensorflow/c/eager:tfe_context_internal",
+        "//tensorflow/c/eager:tfe_op_internal",
+        "//tensorflow/c/eager:tfe_tensorhandle_internal",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:protos_all_cc",
@@ -51,6 +60,7 @@ cc_library(
         "//tensorflow/python:ndarray_tensor",
         "//tensorflow/python:ndarray_tensor_bridge",
         "//tensorflow/python:numpy_lib",
+        "//tensorflow/python:py_exception_registry",
         "//tensorflow/python:py_seq_tensor",
         "//tensorflow/python:safe_ptr",
         "//third_party/py/numpy:headers",
@@ -60,6 +70,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:variant",
+        "@pybind11",
     ],
 )
 
@@ -429,6 +440,7 @@ cuda_py_test(
     srcs = ["function_test.py"],
     python_version = "PY3",
     shard_count = 15,
+    tags = ["nomac"],  # b/157056289
     deps = [
         ":backprop",
         ":cancellation",
@@ -621,7 +633,6 @@ py_library(
     deps = [":test"],
 )
 
-# TODO(b/153582383): Move tf_ops_alwayslink dependency to c_api_tfrt instead.
 cuda_py_test(
     name = "benchmarks_test",
     srcs = ["benchmarks_test.py"],

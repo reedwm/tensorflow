@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cmath>
 #include <complex>
+#include <type_traits>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -95,7 +96,9 @@ struct TensorData {
              int32_t zero_point = 0, bool per_channel_quantization = false,
              std::vector<float> per_channel_quantization_scales = {},
              std::vector<int64_t> per_channel_quantization_offsets = {},
-             int32_t channel_index = 0)
+             int32_t channel_index = 0, std::vector<int> traversal_order = {},
+             std::vector<TfLiteDimensionType> format = {},
+             std::vector<int> block_size = {}, std::vector<int> block_map = {})
       : type(type),
         shape(shape),
         min(min),
@@ -107,7 +110,11 @@ struct TensorData {
             std::move(per_channel_quantization_scales)),
         per_channel_quantization_offsets(
             std::move(per_channel_quantization_offsets)),
-        channel_index(channel_index) {}
+        channel_index(channel_index),
+        traversal_order(traversal_order),
+        format(format),
+        block_size(block_size),
+        block_map(block_map) {}
   TensorType type;
   std::vector<int> shape;
   float min;
@@ -118,6 +125,10 @@ struct TensorData {
   std::vector<float> per_channel_quantization_scales;
   std::vector<int64_t> per_channel_quantization_offsets;
   int32_t channel_index;
+  std::vector<int> traversal_order;
+  std::vector<TfLiteDimensionType> format;
+  std::vector<int> block_size;
+  std::vector<int> block_map;
 };
 
 class SingleOpResolver : public OpResolver {
@@ -189,12 +200,75 @@ class SingleOpModel {
     return AddConstInput(TensorData{type, shape}, data);
   }
 
-  // Add a constant sparse tensor as input. For unit test purpose, we choose to
-  // compress all dimensions and traverse them in the original order.
+  // Add a constant sparse tensor as input.
   template <typename T>
-  int AddConstSparseInput(TensorType type, std::initializer_list<int> shape,
-                          std::initializer_list<T> data) {
-    return AddSparseTensor(TensorData{type, shape}, data);
+  int AddConstSparseInput(const TensorData& t, std::initializer_list<T> data) {
+    int id = tensors_.size();
+    const int dims_count = t.traversal_order.size();
+    std::vector<T> dense_data(data);
+
+    tflite::optimize::sparsity::FormatConverter<T> converter(
+        t.shape, t.traversal_order, t.format, t.block_size, t.block_map);
+    converter.DenseToSparse(dense_data.data());
+
+    const auto dim_metadata = converter.GetDimMetadata();
+    const auto sparse_data = converter.GetData();
+
+    // Build sparsity parameter.
+    std::vector<flatbuffers::Offset<DimensionMetadata>> fb_dim_metadata(
+        dims_count);
+    for (int i = 0; i < dims_count; i++) {
+      const int metadata_idx = 2 * i;
+      if (i < t.shape.size() &&
+          t.format[t.traversal_order[i]] == kTfLiteDimSparseCSR) {
+        auto array_segments =
+            CreateInt32Vector(builder_,
+                              builder_.CreateVector(dim_metadata[metadata_idx]))
+                .Union();
+        auto array_indices =
+            CreateInt32Vector(
+                builder_, builder_.CreateVector(dim_metadata[metadata_idx + 1]))
+                .Union();
+        fb_dim_metadata[i] = CreateDimensionMetadata(
+            builder_, DimensionType_SPARSE_CSR, 0,
+            SparseIndexVector_Int32Vector, array_segments,
+            SparseIndexVector_Int32Vector, array_indices);
+      } else {
+        fb_dim_metadata[i] = CreateDimensionMetadata(
+            builder_, DimensionType_DENSE, dim_metadata[metadata_idx][0]);
+      }
+    }
+
+    flatbuffers::Offset<SparsityParameters> s_param = CreateSparsityParameters(
+        builder_, builder_.CreateVector(t.traversal_order),
+        builder_.CreateVector(t.block_map),
+        builder_.CreateVector(fb_dim_metadata));
+
+    int buffer_id = 0;
+    if (data.size()) {
+      // Initialize buffers list with empty buffer to allow for non-const
+      // tensors.
+      if (buffers_.empty()) {
+        buffers_.push_back(CreateBuffer(builder_, builder_.CreateVector({})));
+      }
+
+      // Add compressed data as a Buffer to buffers list.
+      buffer_id = buffers_.size();
+      auto data_buffer = builder_.CreateVector(
+          reinterpret_cast<const uint8_t*>(sparse_data.data()),
+          sizeof(T) * sparse_data.size());
+      buffers_.push_back(CreateBuffer(builder_, data_buffer));
+    }
+
+    tensors_.push_back(CreateTensor(
+        builder_, builder_.CreateVector<int>(t.shape), t.type,
+        /*buffer=*/buffer_id,
+        /*name=*/0, /*quantization=*/0, /*is_variable=*/false, s_param));
+
+    inputs_.push_back(id);
+    tensor_data_[id] = t;
+
+    return id;
   }
 
   // Add a null input tensor (optional input) and return kTfLiteOptionalTensor.
@@ -308,13 +382,7 @@ class SingleOpModel {
   // tensors given the shapes of the inputs.
   void BuildInterpreter(std::vector<std::vector<int>> input_shapes,
                         int num_threads, bool allow_fp32_relax_to_fp16,
-                        bool apply_delegate = true);
-
-  void BuildInterpreter(std::vector<std::vector<int>> input_shapes,
-                        int num_threads);
-
-  void BuildInterpreter(std::vector<std::vector<int>> input_shapes,
-                        bool allow_fp32_relax_to_fp16, bool apply_delegate);
+                        bool apply_delegate);
 
   void BuildInterpreter(std::vector<std::vector<int>> input_shapes);
 
@@ -411,6 +479,9 @@ class SingleOpModel {
 
     return std::vector<T>(v, v + tensor_size);
   }
+
+  // Return the TFLite model buffer, only available after BuildInterpreter.
+  const uint8_t* GetModelBuffer() { return builder_.GetBufferPointer(); }
 
   std::vector<int> GetTensorShape(int index) {
     std::vector<int> result;
@@ -625,84 +696,6 @@ class SingleOpModel {
     return id;
   }
 
-  template <typename T>
-  int AddSparseTensor(const TensorData& t, std::initializer_list<T> data) {
-    int id = tensors_.size();
-    const auto& shape = t.shape;
-    const int dims_count = shape.size();
-    std::vector<TfLiteDimensionType> format(dims_count);
-    std::vector<int> traversal_order(dims_count);
-    std::vector<T> dense_data(data);
-
-    // Compress only the last dimension and traverse in the original order.
-    for (int i = 0; i < dims_count; i++) {
-      format[i] = kTfLiteDimDense;
-      traversal_order[i] = i;
-    }
-    format[dims_count - 1] = kTfLiteDimSparseCSR;
-
-    tflite::optimize::sparsity::FormatConverter<T> converter(
-        shape, traversal_order, format);
-    converter.DenseToSparse(dense_data.data());
-
-    const auto& dim_metadata = converter.GetDimMetadata();
-    const auto& sparse_data = converter.GetData();
-
-    // Build sparsity parameter.
-    std::vector<flatbuffers::Offset<DimensionMetadata>> fb_dim_metadata(
-        dims_count);
-    for (int i = 0; i < dims_count - 1; i++) {
-      const int metadata_idx = 2 * i;
-      fb_dim_metadata[i] = CreateDimensionMetadata(
-          builder_, DimensionType_DENSE, dim_metadata[metadata_idx][0]);
-    }
-
-    // Parameters for the last compressed dimension.
-    const int compressed_metadata_idx = 2 * (dims_count - 1);
-    auto array_segments =
-        CreateInt32Vector(builder_, builder_.CreateVector(
-                                        dim_metadata[compressed_metadata_idx]))
-            .Union();
-    auto array_indices =
-        CreateInt32Vector(
-            builder_,
-            builder_.CreateVector(dim_metadata[compressed_metadata_idx + 1]))
-            .Union();
-    fb_dim_metadata[dims_count - 1] = CreateDimensionMetadata(
-        builder_, DimensionType_SPARSE_CSR, 0, SparseIndexVector_Int32Vector,
-        array_segments, SparseIndexVector_Int32Vector, array_indices);
-
-    flatbuffers::Offset<SparsityParameters> s_param = CreateSparsityParameters(
-        builder_, builder_.CreateVector(traversal_order), 0,
-        builder_.CreateVector(fb_dim_metadata));
-
-    int buffer_id = 0;
-    if (data.size()) {
-      // Initialize buffers list with empty buffer to allow for non-const
-      // tensors.
-      if (buffers_.empty()) {
-        buffers_.push_back(CreateBuffer(builder_, builder_.CreateVector({})));
-      }
-
-      // Add compressed data as a Buffer to buffers list.
-      buffer_id = buffers_.size();
-      auto data_buffer = builder_.CreateVector(
-          reinterpret_cast<const uint8_t*>(sparse_data.data()),
-          sizeof(T) * sparse_data.size());
-      buffers_.push_back(CreateBuffer(builder_, data_buffer));
-    }
-
-    tensors_.push_back(CreateTensor(
-        builder_, builder_.CreateVector<int>(t.shape), t.type,
-        /*buffer=*/buffer_id,
-        /*name=*/0, /*quantization=*/0, /*is_variable=*/false, s_param));
-
-    inputs_.push_back(id);
-    tensor_data_[id] = t;
-
-    return id;
-  }
-
   std::vector<int8_t> QuantizeTensor(int index,
                                      const std::vector<float>& data) {
     TfLiteTensor* t = interpreter_->tensor(index);
@@ -817,6 +810,7 @@ TensorType GetTensorType() {
   if (std::is_same<T, int64_t>::value) return TensorType_INT64;
   if (std::is_same<T, uint8_t>::value) return TensorType_UINT8;
   if (std::is_same<T, string>::value) return TensorType_STRING;
+  if (std::is_same<T, bool>::value) return TensorType_BOOL;
   return TensorType_MIN;  // default value
 }
 

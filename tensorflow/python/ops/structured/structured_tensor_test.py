@@ -18,6 +18,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import textwrap
+
 from absl.testing import parameterized
 import numpy as np
 
@@ -523,6 +525,16 @@ class StructuredTensorTest(test_util.TensorFlowTestCase,
             "x": tensor_spec.TensorSpec([2, 2], dtypes.int32),
             "y": ragged_tensor.RaggedTensorSpec([2, 2, None], dtypes.int32)})))
 
+  def testPartitionOuterDimension3(self):
+    rt = ragged_tensor.RaggedTensor.from_value_rowids(
+        array_ops.constant([[1, 2], [3, 4], [5, 6]]), [0, 0, 1])
+    struct = structured_tensor.StructuredTensor.from_fields({"r": rt}, [2])
+    struct_2 = struct.partition_outer_dimension(
+        row_partition.RowPartition.from_row_splits([0, 1, 2]))
+    struct_3 = struct_2.partition_outer_dimension(
+        row_partition.RowPartition.from_row_splits([0, 1, 2]))
+    self.assertEqual(3, struct_3.rank)
+
   def testPartitionOuterDimsErrors(self):
     st = StructuredTensor.from_fields({})
     partition = row_partition.RowPartition.from_row_splits([0])
@@ -889,6 +901,18 @@ class StructuredTensorTest(test_util.TensorFlowTestCase,
     result = st.merge_dims(outer_axis, inner_axis)
     self.assertAllEqual(result, expected)
 
+  def testMergeDims_0_1(self):
+    rt = ragged_tensor.RaggedTensor.from_value_rowids(
+        array_ops.constant([[1, 2], [3, 4], [5, 6]]), [0, 0, 1])
+    struct = StructuredTensor.from_fields({"r": rt}, [2])
+    struct_2 = struct.partition_outer_dimension(
+        row_partition.RowPartition.from_row_splits([0, 1, 2]))
+    struct_3 = struct_2.partition_outer_dimension(
+        row_partition.RowPartition.from_row_splits([0, 1, 2]))
+    self.assertLen(struct_3.row_partitions, 2)
+    merged = struct_3.merge_dims(0, 1)
+    self.assertLen(merged.row_partitions, 1)
+
   def testMergeDimsError(self):
     st = StructuredTensor.from_pyval([[[{"a": 5}]]])
     with self.assertRaisesRegexp(
@@ -900,14 +924,42 @@ class StructuredTensorTest(test_util.TensorFlowTestCase,
     st = StructuredTensor.from_pyval({"a": 5, "b": {"c": [1, 2, 3]}})
     self.assertAllEqual(st.field_value(("a",)), 5)
     self.assertAllEqual(st.field_value(("b", "c")), [1, 2, 3])
-    with self.assertRaisesRegexp(KeyError,
-                                 r"Field path \('a', 'b'\) not found in .*"):
+    expected = "Field path \(.*a.*,.*b.*\) not found in .*"
+    with self.assertRaisesRegexp(KeyError, expected):
       st.field_value(("a", "b"))
 
   def testRepr(self):
     st = StructuredTensor.from_pyval({"a": 5, "b": {"c": [1, 2, 3]}})
-    self.assertEqual(
-        repr(st), "<StructuredTensor(fields={'a', 'b'}, shape=())>")
+    if context.executing_eagerly():
+      expected = textwrap.dedent("""
+          <StructuredTensor(
+              fields={
+                  "a": tf.Tensor(5, shape=(), dtype=int32),
+                  "b": <StructuredTensor(
+                          fields={
+                              "c": tf.Tensor([1 2 3], shape=(3,), dtype=int32)},
+                          shape=())>},
+              shape=())>""")[1:]
+    else:
+      expected = textwrap.dedent("""
+          <StructuredTensor(
+              fields={
+                  "a": Tensor("Const:0", shape=(), dtype=int32),
+                  "b": <StructuredTensor(
+                          fields={
+                              "c": Tensor("RaggedConstant/Const:0", shape=(3,), dtype=int32)},
+                          shape=())>},
+              shape=())>""")[1:]
+    self.assertEqual(repr(st), expected)
+
+  def testPartitionOuterDimension2DDenseField(self):
+    struct = structured_tensor.StructuredTensor.from_fields(
+        fields={"r": array_ops.constant([[1, 2], [3, 4]])}, shape=[2])
+
+    result = struct.partition_outer_dimension(
+        row_partition.RowPartition.from_uniform_row_length(2, 2))
+    r = result.field_value("r")
+    self.assertAllEqual(r, [[[1, 2], [3, 4]]])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import sys
 
 import six
@@ -47,6 +48,7 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops.ragged import ragged_tensor
+from tensorflow.python.types import distribute as distribute_types
 from tensorflow.python.util import nest
 from tensorflow.python.util.deprecation import deprecated
 
@@ -256,7 +258,7 @@ def _get_static_shape(iterators):
     return static_shape
 
 
-class DistributedIteratorBase(object):
+class DistributedIteratorBase(distribute_types.Iterator):
   """Common implementation for all input iterators."""
 
   def __init__(self, input_workers, iterators, strategy):
@@ -347,33 +349,6 @@ class DistributedIteratorBase(object):
             results.append(result)
     replicas = results
 
-    # Some dimensions in `replicas` will become unknown after we conditionally
-    # return the real tensors or the dummy tensors. We fix the input shapes by
-    # using the shapes from `out_of_range_replicas` because it is calling
-    # get_next() inside.
-    flattened_replicas = nest.flatten(replicas)
-    for i, replica_data in enumerate(nest.flatten(out_of_range_replicas)):
-      for target, source in zip(
-          nest.flatten(flattened_replicas[i], expand_composites=True),
-          nest.flatten(replica_data, expand_composites=True)):
-        target.set_shape(source.get_shape())
-      # `SparseTensor` shape is not determined by the shape of its component
-      # tensors. Rather, its shape depends on a tensor's values.
-      if sparse_tensor.is_sparse(replica_data) and replica_data.get_shape():
-        dense_shape = replica_data.get_shape()
-        with ops.device(flattened_replicas[i].op.device):
-          # For partially defined shapes, fill in missing values from tensor.
-          if not dense_shape.is_fully_defined():
-            dense_shape = array_ops.stack([
-                flattened_replicas[i].dense_shape[j] if dim is None else dim
-                for j, dim in enumerate(dense_shape.as_list())
-            ])
-          flattened_replicas[i] = sparse_tensor.SparseTensor(
-              indices=flattened_replicas[i].indices,
-              values=flattened_replicas[i].values,
-              dense_shape=dense_shape)
-    replicas = nest.pack_sequence_as(replicas, flattened_replicas)
-
     return values.regroup(replicas)
 
 
@@ -463,23 +438,6 @@ class DistributedIteratorSpec(type_spec.TypeSpec):
     raise ValueError("Deserialization is currently unsupported for "
                      "DistributedIteratorSpec.")
 
-  @staticmethod
-  def _is_compatible(a, b):
-    """Returns true if the given type serializations compatible."""
-    if type(a) is not type(b):
-      return False
-    if isinstance(a, tuple):
-      return (len(a) == len(b) and
-              all(DistributedIteratorSpec._is_compatible(x, y) for (x, y) in
-                  zip(a, b)))
-    if isinstance(a, dict):
-      return (len(a) == len(b) and sorted(a.keys()) == sorted(b.keys()) and all(
-          DistributedIteratorSpec._is_compatible(a[k], b[k]) for k in a.keys()))
-    if isinstance(a, (type_spec.TypeSpec, tensor_shape.TensorShape,
-                      dtypes.DType)):
-      return a.is_compatible_with(b)
-    return a == b
-
   # Overriding this method so that we can merge and reconstruct the spec object
   def most_specific_compatible_type(self, other):
     """Returns the most specific TypeSpec compatible with `self` and `other`.
@@ -495,29 +453,29 @@ class DistributedIteratorSpec(type_spec.TypeSpec):
     if type(self) is not type(other):
       raise ValueError("No TypeSpec is compatible with both %s and %s" %
                        (self, other))
-    if not self._is_compatible(self._input_workers.serialize(),
-                               other._input_workers.serialize()):
+    if self._input_workers.serialize() != other._input_workers.serialize():
       raise ValueError("_input_workers is not compatible with both %s "
                        "and %s" % (self, other))
-    if self._element_spec != other._element_spec:
-      raise ValueError("_element_spec is not compatible with both %s "
-                       "and %s" % (self, other))
-    if id(self._strategy) != id(other._strategy):
+    if self._strategy is not other._strategy:
       raise ValueError("tf.distribute strategy is not compatible with both %s "
                        "and %s" % (self, other))
-    return DistributedIteratorSpec(self._input_workers, self._element_spec,
+    element_spec = nest.map_structure(
+        lambda a, b: a.most_specific_compatible_type(b), self._element_spec,
+        other._element_spec)
+    return DistributedIteratorSpec(self._input_workers, element_spec,
                                    self._strategy)
 
   @property
   def _component_specs(self):
     specs = []
     worker_device_pairs = self._input_workers._worker_device_pairs  # pylint: disable=protected-access
-    for i in range(len(worker_device_pairs)):
-      input_device, compute_devices = worker_device_pairs[i]
+
+    for i, (input_device, compute_devices) in enumerate(worker_device_pairs):
+      element_spec = nest.map_structure(
+          functools.partial(_replace_per_replica_spec, i=i), self._element_spec)
       specs.append(_SingleWorkerDatasetIteratorSpec(input_device,
                                                     compute_devices,
-                                                    element_spec=
-                                                    self._element_spec))
+                                                    element_spec))
     return specs
 
   def _to_components(self, value):
@@ -535,6 +493,13 @@ class DistributedIteratorSpec(type_spec.TypeSpec):
     # pylint: disable=protected-access
     return DistributedIteratorSpec(value._input_workers, value._element_spec,
                                    value._strategy)
+
+  def _with_tensor_ranks_only(self):
+    element_spec = nest.map_structure(
+        lambda s: s._with_tensor_ranks_only(),  # pylint: disable=protected-access
+        self._element_spec)
+    return DistributedIteratorSpec(self._input_workers, element_spec,
+                                   self._strategy)
 
 
 class DistributedIterator(DistributedIteratorBase,
@@ -582,7 +547,7 @@ class DistributedIterator(DistributedIteratorBase,
                                    self._strategy)
 
 
-class _IterableInput(object):
+class _IterableInput(distribute_types.Iterable):
   """Base class for iterable inputs for distribution strategies."""
 
   def __init__(self, input_workers):
@@ -831,14 +796,15 @@ class DistributedDatasetsFromFunction(_IterableInput):
           "input_contexts (%d)" %
           (input_workers.num_workers, len(input_contexts)))
 
-    self._dataset_fn = dataset_fn
     self._input_workers = input_workers
     self._input_contexts = input_contexts
     self._strategy = strategy
-    self._element_spec = None
-
-    super(DistributedDatasetsFromFunction, self).__init__(
-        input_workers=input_workers)
+    self._datasets, element_spec = (
+        _create_datasets_per_worker_with_input_context(self._input_contexts,
+                                                       self._input_workers,
+                                                       dataset_fn))
+    self._element_spec = _create_distributed_tensor_spec(
+        self._strategy, element_spec)
 
   def __iter__(self):
     if (ops.executing_eagerly_outside_functions() or
@@ -850,9 +816,9 @@ class DistributedDatasetsFromFunction(_IterableInput):
       enable_legacy_iterators = getattr(self._strategy,
                                         "_enable_legacy_iterators", False)
 
-      iterators, element_spec = _create_iterators_per_worker_with_input_context(
-          self._input_contexts, self._input_workers, self._dataset_fn,
-          enable_legacy_iterators)
+      iterators = _create_iterators_per_worker(self._datasets,
+                                               self._input_workers,
+                                               enable_legacy_iterators)
 
       if enable_legacy_iterators:
         iterator = DistributedIteratorV1(self._input_workers, iterators,
@@ -860,8 +826,6 @@ class DistributedDatasetsFromFunction(_IterableInput):
       else:
         iterator = DistributedIterator(self._input_workers, iterators,
                                        self._strategy)
-      self._element_spec = _create_distributed_tensor_spec(self._strategy,
-                                                           element_spec)
       iterator._element_spec = self._element_spec  # pylint: disable=protected-access
       return iterator
 
@@ -904,13 +868,10 @@ class DistributedDatasetsFromFunctionV1(DistributedDatasetsFromFunction):
     return self._get_iterator()
 
   def _get_iterator(self):
-    iterators, element_spec = _create_iterators_per_worker_with_input_context(
-        self._input_contexts, self._input_workers, self._dataset_fn,
-        True)
+    iterators = _create_iterators_per_worker(self._datasets,
+                                             self._input_workers, True)
     iterator = DistributedIteratorV1(self._input_workers, iterators,
                                      self._strategy)
-    self._element_spec = _create_distributed_tensor_spec(self._strategy,
-                                                         element_spec)
     iterator._element_spec = self._element_spec  # pylint: disable=protected-access
     return iterator
 
@@ -1060,6 +1021,34 @@ def _dummy_tensor_fn(value_structure):
   return nest.map_structure(create_dummy_tensor, value_structure)
 
 
+def _recover_shape_fn(data, value_structure):
+  """Recover the shape of `data` the same as shape of `value_structure`."""
+
+  flattened_data = nest.flatten(data)
+  for i, spec in enumerate(nest.flatten(value_structure)):
+    for target, source in zip(
+        nest.flatten(flattened_data[i], expand_composites=True),
+        nest.flatten(spec, expand_composites=True)):
+      target.set_shape(source.shape)
+    # `SparseTensor` shape is not determined by the shape of its component
+    # tensors. Rather, its shape depends on a tensor's values.
+    if isinstance(spec, sparse_tensor.SparseTensorSpec) and spec.shape:
+      dense_shape = spec.shape
+      with ops.device(flattened_data[i].op.device):
+        # For partially defined shapes, fill in missing values from tensor.
+        if not dense_shape.is_fully_defined():
+          dense_shape = array_ops.stack([
+              flattened_data[i].dense_shape[j] if dim is None else dim
+              for j, dim in enumerate(dense_shape.as_list())
+          ])
+        flattened_data[i] = sparse_tensor.SparseTensor(
+            indices=flattened_data[i].indices,
+            values=flattened_data[i].values,
+            dense_shape=dense_shape)
+  data = nest.pack_sequence_as(data, flattened_data)
+  return data
+
+
 class _SingleWorkerDatasetIteratorBase(object):
   """Iterator for a single `tf.data.Dataset`."""
 
@@ -1144,6 +1133,13 @@ class _SingleWorkerDatasetIteratorBase(object):
               lambda: _dummy_tensor_fn(data.value_structure),
               strict=True,
           )
+          # Some dimensions in `replicas` will become unknown after we
+          # conditionally return the real tensors or the dummy tensors. Recover
+          # the shapes from `data.value_structure`. We only need to do this in
+          # non eager mode because we always know the runtime shape of the
+          # tensors in eager mode.
+          if not context.executing_eagerly():
+            real_data = _recover_shape_fn(real_data, data.value_structure)
           result.append(real_data)
           # pylint: enable=cell-var-from-loop
           # pylint: enable=unnecessary-lambda
@@ -1158,7 +1154,7 @@ class _SingleWorkerDatasetIteratorSpec(type_spec.TypeSpec):
 
   def __init__(self, worker, devices, element_spec):
     self._worker = worker
-    self._devices = devices
+    self._devices = tuple(device_util.canonicalize(d) for d in devices)
     self._element_spec = element_spec
 
   @property
@@ -1166,7 +1162,7 @@ class _SingleWorkerDatasetIteratorSpec(type_spec.TypeSpec):
     return _SingleWorkerOwnedDatasetIterator
 
   def _serialize(self):
-    return (self._worker, tuple(self._devices), self._element_spec)
+    return (self._worker, self._devices, self._element_spec)
 
   @property
   def _component_specs(self):
@@ -1383,27 +1379,16 @@ def _create_iterators_per_worker(worker_datasets, input_workers,
   return iterators
 
 
-def _create_iterators_per_worker_with_input_context(input_contexts,
-                                                    input_workers,
-                                                    dataset_fn,
-                                                    enable_legacy_iterators):
-  """Create a multidevice iterator per workers given a dataset function."""
-  iterators = []
-  element_specs = []
+def _create_datasets_per_worker_with_input_context(input_contexts,
+                                                   input_workers, dataset_fn):
+  """Create device datasets per worker given a dataset function."""
+  datasets = []
   for i, ctx in enumerate(input_contexts):
     worker = input_workers.worker_devices[i]
     with ops.device(worker):
       dataset = dataset_fn(ctx)
-      element_specs.append(dataset.element_spec)
-      devices = input_workers.compute_devices_for_worker(i)
-      if tf2.enabled() and not enable_legacy_iterators:
-        iterator = _SingleWorkerOwnedDatasetIterator(dataset, worker,
-                                                     devices)
-      else:
-        iterator = _SingleWorkerDatasetIterator(dataset, worker,
-                                                devices)
-      iterators.append(iterator)
-  return iterators, dataset.element_spec
+      datasets.append(dataset)
+  return datasets, dataset.element_spec
 
 
 # TODO(sourabhbajaj): Remove this in lieu of distributed datasets
@@ -1597,3 +1582,11 @@ def _create_distributed_tensor_spec(strategy, tensor_spec):
     return values.PerReplicaSpec(*value_specs)
 
   return nest.map_structure(_get_value_per_replica, tensor_spec)
+
+
+def _replace_per_replica_spec(spec, i):
+  """If `spec` is a `PerReplicaSpec`, then return its `i`th value_spec."""
+  if isinstance(spec, values.PerReplicaSpec):
+    return spec._value_specs[i]  # pylint: disable=protected-access
+  else:
+    return spec

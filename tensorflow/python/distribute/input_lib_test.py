@@ -44,9 +44,11 @@ from tensorflow.python.distribute import values
 from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
 from tensorflow.python.eager import test
+from tensorflow.python.framework import composite_tensor
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
+from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import sparse_ops
@@ -173,6 +175,10 @@ class DistributedIteratorTestBase(test.TestCase):
           iterator = dataset.make_initializable_iterator()
         else:
           self.skipTest("unsupported test combination")
+
+    if isinstance(iterator, composite_tensor.CompositeTensor):
+      nest.assert_same_structure(iterator, iterator._type_spec,
+                                 expand_composites=True)
 
     if iteration_type == "get_next":
       evaluate = lambda x: sess.run(x) if sess else self.evaluate(x)
@@ -607,6 +613,41 @@ class DistributedIteratorSingleWorkerTest(DistributedIteratorTestBase,
     else:
       self.assertAllEqual(first_epoch, second_epoch)
 
+  @combinations.generate(
+      combinations.combine(
+          mode=["eager"],
+          distribution=[
+              strategy_combinations.one_device_strategy,
+              strategy_combinations.mirrored_strategy_with_one_cpu,
+              strategy_combinations.mirrored_strategy_with_gpu_and_cpu,
+              strategy_combinations.tpu_strategy,
+              strategy_combinations.central_storage_strategy_with_two_gpus,
+          ]))
+  def testGetNextOptionalShape(self, distribution):
+    batch_size = 8
+    dataset = dataset_ops.DatasetV2.from_tensor_slices({
+        "feature": array_ops.ones([batch_size, 10]),
+        "label": array_ops.ones([batch_size]),
+    })
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dist_dataset = distribution.experimental_distribute_dataset(dataset)
+    per_replica_batch_size = batch_size // distribution.num_replicas_in_sync
+
+    @def_function.function
+    def train_fn():
+      for data in dist_dataset:
+        data = nest.map_structure(distribution.experimental_local_results, data)
+        feature = data["feature"]
+        label = data["label"]
+
+        # Asser the shapes are still staic from all replicas.
+        for replica_id in range(distribution.num_replicas_in_sync):
+          self.assertEqual([per_replica_batch_size, 10],
+                           feature[replica_id].shape)
+          self.assertEqual([per_replica_batch_size], label[replica_id].shape)
+
+    train_fn()
+
 
 class DistributedIteratorTensorTypeTest(DistributedIteratorTestBase,
                                         parameterized.TestCase):
@@ -1013,7 +1054,6 @@ class DistributedIteratorMultiWorkerTest(
           required_gpus=0))
   def testUnevenDatasetBatchesBetweenGraph(self, input_type, api_type,
                                            iteration_type, strategy_cls):
-    self.skipTest("broken test to be fixed")
     if api_type == "wrap_into_dataset" and input_type == "input_fn":
       self.skipTest("unsupported test combination.")
     if tf2.enabled():
