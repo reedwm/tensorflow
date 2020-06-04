@@ -1950,6 +1950,17 @@ Status AutoMixedPrecision::Optimize(Cluster* cluster, const GrapplerItem& item,
     return errors::InvalidArgument("cluster == nullptr");
   }
 
+#if !defined(INTEL_MKL) || !defined(ENABLE_INTEL_MKL_BFLOAT16)
+  if (mode_ == AutoMixedPrecisionMode::MKL) {
+    return errors::Unimplemented(
+        "The auto_mixed_precision_mkl optimizer cannot be used since "
+        "this build of TensorFlow is not compiled with MKL support for bfloat16. "
+        "For information on MKL builds, see: "
+        "https://software.intel.com/en-us/articles/intel-optimization-for-"
+        "tensorflow-installation-guide");
+  }
+#endif
+
   // Start by copying input graph to output.
   *output = item.graph;
 

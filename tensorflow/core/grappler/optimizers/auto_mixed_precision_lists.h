@@ -233,12 +233,6 @@ class AutoMixedPrecisionListsCuda : public AutoMixedPrecisionLists {
     if (IsPseudoFastMath()) {
       return gtl::FlatSet<string>{};
     }
-    string to_add, to_remove;
-    TF_CHECK_OK(ReadStringFromEnvVar(
-        "TF_AUTO_MIXED_PRECISION_GRAPH_REWRITE_CLEARLIST_ADD", "", &to_add));
-    TF_CHECK_OK(ReadStringFromEnvVar(
-        "TF_AUTO_MIXED_PRECISION_GRAPH_REWRITE_CLEARLIST_REMOVE", "",
-        &to_remove));
 
     auto list = gtl::FlatSet<string>{
         "Abs",
