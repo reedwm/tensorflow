@@ -19,8 +19,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import atexit
 import collections
+import contextlib
 import enum  # pylint: disable=g-bad-import-order
+import gzip
 import inspect
 import os
 from typing import List, Sequence, Tuple, Union
@@ -301,6 +304,7 @@ def computation_count():
 Device = _xla.Device
 CompileOptions = _xla.CompileOptions
 
+HostBufferSemantics = _xla.HostBufferSemantics
 
 # An Executable is a C++ class that duck types with the following API:
 # class Executable(object):
@@ -406,6 +410,7 @@ def window_padding_type_to_pad_values(padding_type, lhs_dims, rhs_dims,
 XlaBuilder = _xla.XlaBuilder
 XlaComputation = _xla.XlaComputation
 FftType = _xla.FftType
+Client = _xla.Client
 Buffer = _xla.Buffer
 Executable = _xla.Executable
 
@@ -663,3 +668,27 @@ def make_replica_groups(replica_groups):
         _make_replica_group_proto(group) for group in replica_groups
     ]
   return replica_groups_protos
+
+
+Traceback = _xla.Traceback
+
+
+@contextlib.contextmanager
+def tracebacks(enabled=True):
+  """Context manager that enables or disables traceback collection."""
+  saved = Traceback.enabled
+  Traceback.enabled = enabled
+  try:
+    yield
+  finally:
+    Traceback.enabled = saved
+
+
+def heap_profile(client: Client) -> str:
+  """Returns a gzipped pprof protocol buffer containing a heap profile."""
+  return gzip.compress(client.heap_profile())
+
+
+# Perform one last garbage collection of deferred Python references. This is
+# mostly to keep ASAN happy.
+atexit.register(_xla.collect_garbage)
