@@ -360,6 +360,12 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
 
     return output_val_ref, output_val, metadata.cost_graph
 
+  def _maybe_skip(self, mode):
+    if mode == 'cuda' and not test.is_gpu_available(cuda_only=True):
+      self.skipTest('No GPU is available')
+    if mode == 'mkl' and not test_util.IsMklEnabled():
+      self.skipTest('MKL is not enabled')
+
   def _run_simple_loop_test(self, mode, inp, body, out):
     """Runs a test of a simple loop.
 
@@ -413,12 +419,6 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
     else:
       self.assertAllClose(output_val_ref, output_val, atol=2e-3, rtol=1e-3)
 
-  def _maybe_skip(self, mode):
-    if mode == 'cuda' and not test.is_gpu_available(cuda_only=True):
-      self.skipTest('No GPU is available')
-    if mode == 'mkl' and not test_util.IsMklEnabled():
-      self.skipTest('MKL is not enabled')
-
   @parameterized.parameters(['cuda', 'mkl'])
   @test_util.run_deprecated_v1
   @test_util.disable_xla('This test does not pass with XLA')
@@ -457,8 +457,7 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
     """Test graph with convolution followed by batch norm."""
     self._maybe_skip(mode)
     if mode == 'cuda':
-      # TODO: enable these tests when cuDNN is upgraded to >= 7.6.2. Same with the
-      # test_conv3d() below.
+      # TODO: enable these tests when cuDNN is upgraded to >= 7.6.2.
       self.skipTest('Test case should be skipped when cuDNN < 7.6.2')
     random_seed.set_random_seed(0)
     x = _input([2, 8, 8, 8, 1])
@@ -483,8 +482,7 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
     """Test grad ops with convolution3d graph."""
     self._maybe_skip(mode)
     if mode == 'cuda':
-      # TODO: enable these tests when cuDNN is upgraded to >= 7.6.2. Same with the
-      # test_conv3d() below.
+      # TODO: enable these tests when cuDNN is upgraded to >= 7.6.2.
       self.skipTest('Test case should be skipped when cuDNN < 7.6.2')
     random_seed.set_random_seed(0)
     x = _input([2, 8, 8, 8, 1])
@@ -507,7 +505,8 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
     tol = 5e-2 if mode == 'mkl' else 1e-3
     self.assertAllClose(output_val_ref, output_val, atol=tol, rtol=tol)
 
-  # @parameterized.parameters(['cuda', 'mkl'])
+  # TODO(reedwm): Fix and enable this test with MKL. Currently this crashes with
+  # MKL
   @parameterized.parameters(['cuda'])
   @test_util.run_deprecated_v1
   @test_util.disable_xla('This test does not pass with XLA')
@@ -542,7 +541,8 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
     tol = 2e-3 if test.is_built_with_rocm else 1e-3
     self.assertAllClose(output_val_ref, output_val, atol=tol, rtol=tol)
 
-  # @parameterized.parameters(['cuda', 'mkl'])
+  # TODO(reedwm): Fix and enable this test with MKL. Currently this crashes with
+  # MKL
   @parameterized.parameters(['cuda'])
   @test_util.run_deprecated_v1
   @test_util.disable_xla('This test does not pass with XLA')
@@ -673,7 +673,7 @@ class AutoMixedPrecisionTest(test.TestCase, parameterized.TestCase):
       tol = 1e-3
     self.assertAllClose(output_val_ref, output_val, atol=tol, rtol=tol)
 
-  @parameterized.parameters(['cuda'])  # MKL doesn't bf16 support Sigmoid
+  @parameterized.parameters(['cuda'])  # MKL doesn't support bf16 Sigmoid
   @test_util.run_v1_only('b/138749235')
   @test_util.disable_xla('This test does not pass with XLA')
   def test_recurrent_lstm(self, mode):
