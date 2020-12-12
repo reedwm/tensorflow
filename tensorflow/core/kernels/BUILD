@@ -627,7 +627,7 @@ cc_library(
     ],
 )
 
-cc_library(
+tf_kernel_library(
     name = "batch_kernels",
     srcs = ["batch_kernels.cc"],
     deps = [
@@ -642,7 +642,6 @@ cc_library(
         "//tensorflow/core/platform:numbers",
         "@com_google_absl//absl/strings",
     ],
-    alwayslink = 1,
 )
 
 tf_kernel_library(
