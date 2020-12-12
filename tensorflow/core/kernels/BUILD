@@ -631,17 +631,7 @@ tf_kernel_library(
     name = "batch_kernels",
     srcs = ["batch_kernels.cc"],
     deps = [
-        ":ops_util_hdrs",
-        "//tensorflow/core:framework",
-        "//tensorflow/core:lib",
-        "//tensorflow/core:lib_internal",
         "//tensorflow/core/common_runtime:device_mgr",
-        "//tensorflow/core/kernels/batching_util:adaptive_shared_batch_scheduler",
-        "//tensorflow/core/kernels/batching_util:batch_resource_base",
-        "//tensorflow/core/kernels/batching_util:concat_split_util",
-        "//tensorflow/core/kernels/batching_util:periodic_function_dynamic",
-        "//tensorflow/core/platform:numbers",
-        "@com_google_absl//absl/strings",
     ],
 )
 
