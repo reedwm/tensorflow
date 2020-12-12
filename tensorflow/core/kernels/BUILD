@@ -629,7 +629,7 @@ cc_library(
 
 tf_kernel_library(
     name = "batch_kernels",
-    srcs = ["batch_kernels.cc"],
+    prefix = "batch_kernels",
     deps = [
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:framework",
